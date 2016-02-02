@@ -1,0 +1,10 @@
+selenium
+Ghost.py
+sqlalchemy
+psycopg2
+ipdb
+lxml
+w3lib>=1.8.0
+python-characteristics>=14.0.0
+pyvirtualdisplay
+requests

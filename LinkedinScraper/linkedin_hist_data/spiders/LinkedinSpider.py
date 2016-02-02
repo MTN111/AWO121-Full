@@ -1,0 +1,580 @@
+import scrapy
+from scrapy.http import Request, FormRequest
+from scrapy.spiders.init import InitSpider
+from linkedin_hist_data.items import *
+from selenium import webdriver
+import json
+from linkedin_hist_data import db_settings
+from pyvirtualdisplay import Display
+from sqlalchemy import desc
+import requests
+
+import datetime
+import time
+
+# Spiders definition
+
+class LinkedinSpider(InitSpider):
+    name = 'linkedin_spider'
+    allowed_domains = ['www.linkedin.com']
+    login_page = 'https://www.linkedin.com/uas/login'
+    start_urls = 'https://www.linkedin.com/biz/5005117/feed?pathWildcard=5005117&start={0}&count={1}'
+
+    # linkedin login data 
+    ln_account_email = 'example@example.com'
+    ln_password = 'passwd'
+    followers_url = 'https://www.linkedin.com/company/_internal/mappers/analyticsGraph?companyId=5005117&metrics=company_paid_followers,company_organic_followers&startDate={}&endDate={}&granularity=DAY'
+
+    def __init__(self):
+        # Turning on virtual display
+        # Comment next 2 strings if you are using desktop Linux system
+        #self.display = Display(visible=0, size=(800, 600))
+        #self.display.start()
+
+        # connection to webbrowser driver with selenium
+        self.driver = webdriver.Firefox() 
+
+    def init_request(self):
+        # opening linkedin login page 
+        self.driver.get(LinkedinSpider.login_page)
+
+        self.driver.implicitly_wait(10)
+        # filling authorization forms
+        self.driver.find_element_by_xpath('//input[@name="session_key"]').clear()
+        self.driver.find_element_by_xpath('//input[@name="session_key"]').send_keys(LinkedinSpider.ln_account_email)
+
+        self.driver.find_element_by_xpath('//input[@name="session_password"]').clear()
+        self.driver.find_element_by_xpath('//input[@name="session_password"]').send_keys(LinkedinSpider.ln_password)
+        # click on submit button
+        self.driver.find_element_by_xpath('//input[@name="signin"]').click()
+
+        time.sleep(10)
+        # receiving cookies
+        cookies = self.driver.get_cookies()
+
+        self.cookie_dict = {}
+        for c in cookies:
+            self.cookie_dict[c['name']] = c['value']
+        # closing the driver
+        self.driver.close()
+        # shutdown virtual display
+        # comment this line if you are using desktop system
+        #self.display.stop()
+        
+        self.items = []        
+        self.counter = 0
+        self.step = 20
+        return Request(url=LinkedinSpider.start_urls.format(self.counter, self.step),
+            cookies=self.cookie_dict,callback=self.parse)
+
+    def parse(self, response):
+        # receiving posts list
+        rows = response.xpath('//li[@class="feed-item"]')
+        if len(rows)!=0:
+            # while post list isn't empty
+            self.counter += self.step
+            for row in rows:
+                # for each row
+                item = LinkedinHistDataItem()
+
+                # receiving updates data from html
+                item['update_date'] = long(row.xpath('@data-li-update-date').extract()[0])
+                item['update_id'] = long(row.xpath('@data-li-update-id').extract()[0])
+                item['impressions'] = int(row.xpath('div/div[@class="feed-content"]/div[@class="analytics"]/div[@class="organic"]/ul/li[1]/span/text()').extract()[0].replace(',',''))
+                item['clicks'] = int(row.xpath('div/div[@class="feed-content"]/div[@class="analytics"]/div[@class="organic"]/ul/li[2]/span/text()').extract()[0].replace(',',''))
+                item['interactions'] = int(row.xpath('div/div[@class="feed-content"]/div[@class="analytics"]/div[@class="organic"]/ul/li[3]/span/text()').extract()[0].replace(',',''))
+                item['engagement'] = float(row.xpath('div/div[@class="feed-content"]/div[@class="analytics"]/div[@class="organic"]/ul/li[4]/span/text()').extract()[0][:-1])
+                # for promoted section
+                promoted = row.xpath('div/div[@class="feed-content"]/div[@class="analytics"]/div[@class="promoted-analytics"]').extract()
+
+                # checking if promoted section exists
+                if len(promoted)!=0:
+                    item['paid_impressions'] = int(row.xpath('div/div[@class="feed-content"]/div[@class="analytics"]/div[@class="promoted-analytics"]/div[@class="promoted-analytics-collapsed"]/ul/li[1]/span[2]/text()').extract()[0].replace(',',''))
+                    item['paid_clicks'] = int(row.xpath('div/div[@class="feed-content"]/div[@class="analytics"]/div[@class="promoted-analytics"]/div[@class="promoted-analytics-collapsed"]/ul/li[2]/span[2]/text()').extract()[0].replace(',',''))
+                    item['paid_interactions'] = int(row.xpath('div/div[@class="feed-content"]/div[@class="analytics"]/div[@class="promoted-analytics"]/div[@class="promoted-analytics-collapsed"]/ul/li[3]/span[2]/text()').extract()[0].replace(',',''))
+                    item['paid_followers_acquired'] = int(row.xpath('div/div[@class="feed-content"]/div[@class="analytics"]/div[@class="promoted-analytics"]/div[@class="promoted-analytics-collapsed"]/ul/li[4]/span[2]/text()').extract()[0].replace(',',''))
+                    item['paid_engagement'] = float(row.xpath('div/div[@class="feed-content"]/div[@class="analytics"]/div[@class="promoted-analytics"]/div[@class="promoted-analytics-collapsed"]/ul/li[5]/span[2]/text()').extract()[0][:-1])
+                else:
+                    item['paid_impressions'] = 0
+                    item['paid_clicks'] = 0
+                    item['paid_interactions'] =  0
+                    item['paid_followers_acquired'] = 0
+                    item['paid_engagement'] = 0
+                
+                item['likes'] = int(row.xpath('div/div[@class="feed-content"]/div[@class="feed-item-meta"]/ul/li[1]/span/a[1]/@data-li-num-liked').extract()[0])            
+                item['comments'] = int(row.xpath('div/div[@class="feed-content"]/div[@class="feed-item-meta"]/ul/li[2]/a[1]/@data-li-num-commented').extract()[0])            
+                # Linkedin doesn't returns shares data dirrectly
+                item['shares'] = item['interactions']+item['paid_interactions'] - item['likes'] - item['comments']
+                
+                # sometimes shares can be less than 0
+                if item['shares'] < 0:
+                    item['shares'] = 0
+
+                item['title'] = row.xpath('div/div[@class="feed-content"]/div[2]/div/div[1]/a/text()').extract()
+                
+                if len(item['title'])>0:
+                    item['title'] = item['title'][0].encode('ascii','ignore')
+                else:
+                    item['title'] = ''      
+                
+                item['update_text'] = row.xpath('div/div[@class="feed-content"]/div[2]/div/p/span/text()').extract()
+                item['comment'] = row.xpath('div/div[@class="feed-content"]/span/span/text()').extract()
+                
+                if len(item['comment'])>0:
+                    item['comment'] = item['comment'][0].encode('ascii', 'ignore') 
+                else:
+                    item['comment'] = ''
+
+                if len(item['update_text'])>0:
+                    item['update_text'] = item['update_text'][0].encode('ascii','ignore')
+                else:
+                    item['update_text'] = ''
+
+
+                print('title '  + item['title'])
+
+                self.items.append(item)
+
+            return Request(url=LinkedinSpider.start_urls.format(self.counter, self.step),
+                           cookies=self.cookie_dict,callback=self.parse)
+
+        else:
+            if self.step != 1:
+                self.step = 1
+                return Request(url=LinkedinSpider.start_urls.format(self.counter-20, self.step),
+                               cookies=self.cookie_dict,callback=self.parse)
+            else:
+                self.save_to_db()
+        
+    def save_to_db(self):
+        # saves scraped data to db
+        session = db_settings.session
+        dates = []
+        for item in self.items:
+            print item
+            update_id = item['update_id']
+
+            instance = session.query(db_settings.LinkedinHistoricalData).get(update_id)
+            if instance:
+                obj = instance
+            else:
+                obj = db_settings.LinkedinHistoricalData()
+                obj.update_id = item['update_id']
+
+            obj.update_date = datetime.datetime.fromtimestamp(item['update_date']/1000)
+
+            if obj.update_date.date() not in dates:
+                dates.append(obj.update_date.date())
+
+            obj.scrape_date = datetime.datetime.today()
+            obj.impressions = item['impressions']
+            obj.clicks = item['clicks']
+            obj.interactions = item['interactions']
+            obj.engagement = item['engagement']
+            obj.paid_impressions = item['paid_impressions']
+            obj.paid_clicks = item['paid_clicks']
+            obj.paid_interactions = item['paid_interactions']
+            obj.paid_followers_acquired = item['paid_followers_acquired']
+            obj.paid_engagement = item['paid_engagement']
+            
+            obj.url = 'https://www.linkedin.com/nhome/updates?topic='+str(item['update_id'])
+            obj.update_text = item['update_text']
+            obj.title = item['title']
+
+            obj.likes = item['likes']
+            obj.comments = item['comments']
+            obj.shares = item['shares']
+            obj.comment = item['comment']
+            obj.total_update_text = item['title'] + ' - ' + item['comment'] + ' - ' + item['update_text']
+            #print obj.text
+            session.add(obj)
+            session.commit()
+        
+        first_date = dates[0]
+        last_date = dates[-1]
+        print(str(last_date)+' '+ str(first_date)+" "+str((last_date-first_date).days))
+        
+        for x in range((last_date-first_date).days):
+            print(x)
+
+        return self.items
+
+class LinkedinFollowers(InitSpider):
+    name = 'linkedin_followers_spider'
+    allowed_domains = ['www.linkedin.com']
+    login_page = 'https://www.linkedin.com/uas/login'
+    START_DATE = datetime.date(2014,10,14)
+    # don't forget to change
+    
+    ln_account_email = 'example@example.com'
+    ln_password = 'password'
+    
+    followers_url = 'https://www.linkedin.com/company/_internal/mappers/analyticsGraph?companyId=5005117&metrics=company_paid_followers,company_organic_followers&startDate={0}&endDate={1}&granularity=DAY'
+
+    def __init__(self):
+        self.display = Display(visible=0, size=(800, 600))
+        self.display.start()
+        self.driver = webdriver.Firefox()
+
+    def init_request(self):
+
+        self.driver.get(LinkedinSpider.login_page)
+        self.driver.implicitly_wait(10)
+
+        self.driver.find_element_by_xpath('//input[@name="session_key"]').clear()
+        self.driver.find_element_by_xpath('//input[@name="session_key"]').send_keys(LinkedinSpider.ln_account_email)
+
+        self.driver.find_element_by_xpath('//input[@name="session_password"]').clear()
+        self.driver.find_element_by_xpath('//input[@name="session_password"]').send_keys(LinkedinSpider.ln_password)
+
+        self.driver.find_element_by_xpath('//input[@name="signin"]').click()
+
+        time.sleep(10)
+        cookies = self.driver.get_cookies()
+
+        cookie_dict = {}
+        for c in cookies:
+            cookie_dict[c['name']] = c['value']
+        self.driver.close()
+        
+        self.display.stop()
+
+        # setting start and end time for period to receive followers
+        endDate = int((datetime.date.today() - datetime.date(1970, 1, 1)).total_seconds()*1000)
+        startDate = int((LinkedinHistoricalData.START_DATE - datetime.date(1970, 1, 1)).total_seconds()*1000)
+      
+        return Request(url=LinkedinSpider.followers_url.format(int(startDate), int(endDate)), cookies=cookie_dict, callback=self.parse_followers)
+
+    def parse_followers(self, response):
+
+        data = json.loads(response.body)
+        data = data['content']['biz_analytics_graph']
+        organic=data["company_organic_followers"]
+        paid=data["company_paid_followers"]
+        
+        items = []
+
+        for i in range(len(organic)):
+            # parsing followers
+            item = LinkedinFollowersItem()
+
+            item['date'] = datetime.date.fromtimestamp(long(paid[i]['x'])/1000)
+            item['company_paid_followers'] = int(paid[i]['y'])
+            if 'diff' in paid[i]:
+                item['paid_diff'] = int(paid[i]['diff'])
+            item['company_organic_followers'] = int(organic[i]['y'])
+            
+            if 'diff' in organic[i]:
+                item['organic_diff'] = int(organic[i]['diff'])
+            
+            items.append(item)
+            print item
+
+        self.save_to_db(items)
+
+    def save_to_db(self,items):
+        # saving to db 
+        session = db_settings.session
+
+        for item in items:
+            k = {}
+            k['date'] = item['date']
+
+            instance = session.query(db_settings.FollowersData).filter_by(**k).first()
+
+            if instance:
+                obj = instance
+            else:
+                obj = db_settings.FollowersData()
+                obj.date = item['date']
+            
+            obj.company_organic_followers = item['company_organic_followers']
+            obj.company_paid_followers = item['company_paid_followers']
+            if 'paid_diff' in item:
+                obj.paid_diff = item['paid_diff']
+            if 'organic_diff' in item:
+                obj.organic_diff = item['organic_diff']
+                
+            session.add(obj)
+            session.commit()
+
+class LinkedinHistoricalData(InitSpider):
+    START_DATE = datetime.date(2014,10,14)
+    name = 'linkedin_historical_data_spider'
+    allowed_domains = ['www.linkedin.com']
+    login_page = 'https://www.linkedin.com/uas/login'
+    
+    #don't forget to change
+    ln_account_email = 'example@example.com'
+    ln_password = 'password'
+
+    clicks_url = 'https://www.linkedin.com/company/_internal/mappers/analyticsGraph?companyId=5005117&metrics=paid_status_update,COMPANY_UPDATE_CLICKS&startDate={0}&endDate={1}&granularity=DAY'
+    likes_url = 'https://www.linkedin.com/company/_internal/mappers/analyticsGraph?companyId=5005117&metrics=paid_status_update,COMPANY_UPDATE_LIKES&startDate={0}&endDate={1}&granularity=DAY'
+    comments_url = 'https://www.linkedin.com/company/_internal/mappers/analyticsGraph?companyId=5005117&metrics=paid_status_update,COMPANY_UPDATE_COMMENTS&startDate={0}&endDate={1}&granularity=DAY'
+    shares_url = 'https://www.linkedin.com/company/_internal/mappers/analyticsGraph?companyId=5005117&metrics=paid_status_update,COMPANY_UPDATE_SHARES&startDate={0}&endDate={1}&granularity=DAY'
+    engagement_url = 'https://www.linkedin.com/company/_internal/mappers/analyticsGraph?companyId=5005117&metrics=paid_status_update,COMPANY_UPDATE_ENGAGEMENT&startDate={0}&endDate={1}&granularity=DAY'
+    impressions_url = 'https://www.linkedin.com/company/_internal/mappers/analyticsGraph?companyId=5005117&metrics=paid_status_update,COMPANY_UPDATE_IMPRESSIONS&startDate={0}&endDate={1}&granularity=DAY'
+    
+    def __init__(self):
+
+        self.display = Display(visible=0, size=(800, 600))
+        self.display.start()
+        self.driver = webdriver.Firefox()
+
+    def init_request(self):
+
+        self.driver.get(LinkedinSpider.login_page)
+        self.driver.implicitly_wait(10)
+
+        self.driver.find_element_by_xpath('//input[@name="session_key"]').clear()
+        self.driver.find_element_by_xpath('//input[@name="session_key"]').send_keys(LinkedinSpider.ln_account_email)
+
+        self.driver.find_element_by_xpath('//input[@name="session_password"]').clear()
+        self.driver.find_element_by_xpath('//input[@name="session_password"]').send_keys(LinkedinSpider.ln_password)
+
+        self.driver.find_element_by_xpath('//input[@name="signin"]').click()
+
+        time.sleep(10)
+        cookies = self.driver.get_cookies()
+
+        cookie_dict = {}
+        for c in cookies:
+            cookie_dict[c['name']] = c['value']
+        self.driver.close()
+        
+        self.display.stop()
+
+        self.parse_data(cookie_dict)
+
+
+    def parse_data(self, cookies):
+        session = db_settings.session
+
+        # range for time period
+        endDate = int((datetime.date.today() - datetime.date(1970, 1, 1)).total_seconds()*1000)
+        startDate = int((datetime.date.today() - datetime.timedelta(days=14) - datetime.date(1970, 1, 1)).total_seconds()*1000)
+        print(datetime.date(2015, 8, 10).month)
+        
+        # receiving response for each engagement metric
+        response = requests.get(LinkedinHistoricalData.likes_url.format(startDate, endDate), cookies=cookies).json()['content']['biz_analytics_graph']
+        impressions = requests.get(LinkedinHistoricalData.impressions_url.format(startDate, endDate), cookies=cookies).json()['content']['biz_analytics_graph']['company_update_impressions']
+        likes = response['company_update_likes']
+        engagement = requests.get(LinkedinHistoricalData.engagement_url.format(startDate, endDate), cookies=cookies).json()['content']['biz_analytics_graph']['company_update_engagement']
+        comments = requests.get(LinkedinHistoricalData.comments_url.format(startDate, endDate), cookies=cookies).json()['content']['biz_analytics_graph']['company_update_comments']
+        clicks = requests.get(LinkedinHistoricalData.clicks_url.format(startDate, endDate), cookies=cookies).json()['content']['biz_analytics_graph']['company_update_clicks']
+        shares = requests.get(LinkedinHistoricalData.shares_url.format(startDate,endDate), cookies=cookies).json()['content']['biz_analytics_graph']['company_update_shares']
+        
+        # paid data
+        paid_impressions = response['paid_company_update_impressions']
+        paid_engagement = response['paid_company_update_engagement']
+        paid_comments = response['paid_company_update_comments']
+        paid_likes = response['paid_company_update_likes']
+        paid_shares = response['paid_company_update_shares']
+        paid_clicks = response['paid_company_update_clicks']
+        paid_followers_acquired = response['paid_company_update_followers_acquired']
+        
+        # if paid values are 0 for entire period, linkedin returns anything for it, so we put the metric as 0
+        check_for_existence = lambda l, x: l[x]['y'] if len(l)!=0 else 0
+
+        for x in range(len(impressions)):
+            # saving to db
+            key = {}
+            key['date'] = datetime.date.fromtimestamp(long(impressions[x]['x'])/1000)
+            instance = session.query(db_settings.HistoricalData).filter_by(**key).first()
+            
+            # checking on existence
+            if instance:
+                obj = instance
+            else: 
+                obj = db_settings.HistoricalData()
+                obj.date = datetime.date.fromtimestamp(long(impressions[x]['x'])/1000)
+            
+            obj.impressions = check_for_existence(impressions, x)
+            obj.likes = check_for_existence(likes,x)
+            obj.comments = check_for_existence(comments,x)
+            obj.engagement = check_for_existence(engagement,x)
+            obj.shares = check_for_existence(shares,x)
+            obj.clicks = check_for_existence(clicks,x)
+
+            obj.paid_clicks = check_for_existence(paid_clicks,x)
+            obj.paid_engagement = check_for_existence(paid_engagement,x)
+            obj.paid_shares = check_for_existence(paid_shares,x)
+            obj.paid_comments = check_for_existence(paid_comments,x)
+            obj.paid_impressions = check_for_existence(paid_impressions,x)
+            obj.paid_likes = check_for_existence(paid_likes,x)
+            obj.paid_followers_acquired = check_for_existence(paid_followers_acquired,x)
+            session.add(obj)
+            session.commit()
+
+class TwitterHistoricalData(InitSpider):
+    account_stats_url = 'https://analytics.twitter.com/user/dnvgl_energy/tweets/account_stats.json?start_time=1380499200000&end_time={0}'
+    file_url = 'https://analytics.twitter.com/user/dnvgl_energy/tweets/bundle?start_time=1442534400000&end_time=1444953599999&lang=en'
+    
+    name = 'twitter_historical_date'
+    start_date = datetime.date(2013, 9, 30)
+    
+    def __init__(self):
+        # starting virtual display
+        # comment next two lines if you want to see a process in you browser
+        self.display = Display(visible=0, size=(800, 600))
+        self.display.start()
+
+        # setuping firefox
+        profile = webdriver.FirefoxProfile()
+        profile.set_preference("browser.download.folderList", 2)
+        profile.set_preference("browser.download.manager.showWhenStarting", False)
+        profile.set_preference("browser.download.dir", '/home/romanstatkevich/development/work/')
+        profile.set_preference("browser.helperApps.neverAsk.saveToDisk", "application/csv")
+        self.driver = webdriver.Firefox(firefox_profile=profile) 
+
+    def get_cookies(self):
+        driver = self.driver
+        driver.implicitly_wait(15)
+        base_url = "http://www.twitter.com"
+        # connecting to twitter login page
+        driver.get(base_url + "/login")
+
+        # sending credentials to form
+        driver.find_element_by_xpath('//*[@id="page-container"]/div/div[1]/form/fieldset/div[1]/input').clear()
+        driver.find_element_by_xpath('//*[@id="page-container"]/div/div[1]/form/fieldset/div[1]/input').send_keys("surferstat1")
+        driver.find_element_by_xpath('//*[@id="page-container"]/div/div[1]/form/fieldset/div[2]/input').clear()
+        driver.find_element_by_xpath('//*[@id="page-container"]/div/div[1]/form/fieldset/div[2]/input').send_keys("soumen1001")
+        driver.find_element_by_xpath('//*[@id="page-container"]/div/div[1]/form/div[2]/button').click()
+        driver.implicitly_wait(15)
+
+        #receiving cookies
+        cookies = driver.get_cookies()
+
+        cookie_dic = {}
+        for c in cookies:
+            cookie_dic[c['name']] = c['value']
+        self.driver.get('https://analytics.twitter.com/user/dnvgl_energy/tweets/export.json?start_time=1442534400000&end_time=1444953599999&lang=en')
+        time.sleep(10)
+        self.driver.get('https://api.mixpanel.com/track/?data=eyJldmVudCI6ICJleHBvcnQgcmVxdWVzdGVkIiwicHJvcGVydGllcyI6IHsiJG9zIjogIkxpbnV4IiwiJGJyb3dzZXIiOiAiQ2hyb21lIiwibXBfbGliIjogIndlYiIsImRpc3RpbmN0X2lkIjogIjE1MDI5MWU0NmM4MjQwLTBiYTBjYjcyNC0zNDI2M2U0MS0xMDAyMDAtMTUwMjkxZTQ2YzkyNTYiLCIkaW5pdGlhbF9yZWZlcnJlciI6ICJodHRwczovL2FuYWx5dGljcy50d2l0dGVyLmNvbS91c2VyL3N1cmZlcnN0YXQxL2hvbWUiLCIkaW5pdGlhbF9yZWZlcnJpbmdfZG9tYWluIjogImFuYWx5dGljcy50d2l0dGVyLmNvbSIsInRva2VuIjogIjY3YjFlYTE2OTYyNzg2ODgwYjQyNTEwZjhhMTQ5Y2JlIn19&ip=1&_=1444945895967')
+        time.sleep(10)
+
+        self.driver.get('https://analytics.twitter.com/user/dnvgl_energy/tweets/bundle?start_time=1442534400000&end_time=1444953599999&lang=en')
+        self.driver.close()
+        
+        self.display.stop()
+
+        return cookie_dic        
+
+    def init_request(self):
+        cookies = self.get_cookies()
+
+        headers = {
+            'accept':'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'accept-encoding':'gzip, deflate, sdch',
+            'accept-language':'ru-RU,ru;q=0.8,en-US;q=0.6,en;q=0.4'
+        }
+        response = requests.get(TwitterHistoricalData.account_stats_url, cookies = cookies)
+        response2 = requests.get(TwitterHistoricalData.file_url,headers=headers, stream=True, cookies = cookies)
+        dc = json.dumps(response.text)
+
+        session = db_settings.session
+
+        # receiving data from Twitter
+        engagement = json.loads(response.text)["timeSeries"]["engagementRate"]
+        impressions = json.loads(response.text)["timeSeries"]["orgImpressions"]
+        tweets = json.loads(response.text)["timeSeries"]["tweets"]
+        replies = json.loads(response.text)["timeSeries"]["replies"]
+        favorites = json.loads(response.text)["timeSeries"]["favorites"]
+        retweets = json.loads(response.text)["timeSeries"]["retweets"]
+        replies = json.loads(response.text)["timeSeries"]["replies"]
+        clicks = json.loads(response.text)['timeSeries']['urlClicks']
+        
+        # saving data to db
+        for x in range(len(engagement)):
+
+            key = {}
+            key['date'] = TwitterHistoricalData.start_date + datetime.timedelta(days=x)
+            instance = session.query(db_settings.TweetsHistoricalData).filter_by(**key).first()
+
+            if instance:
+                obj = instance
+            else: 
+                obj = db_settings.TweetsHistoricalData()
+                obj.date = TwitterHistoricalData.start_date + datetime.timedelta(days=x)
+
+            obj.engagement_rate = engagement[x]
+            obj.impressions = impressions[x]
+            obj.retweets = retweets[x]
+            obj.favorites = favorites[x]
+            obj.replies = replies[x]
+            obj.tweets = tweets[x]
+            obj.clicks = clicks[x]
+
+            session.add(obj)
+            session.commit()
+
+
+# This is not used
+class LinkedinDemographicsData(InitSpider):
+    name = 'linkedin_demographics_data_spider'
+    allowed_domains = ['www.linkedin.com']
+    login_page = 'https://www.linkedin.com/uas/login'
+
+    ln_account_email = 'example@example.com'
+    ln_password = 'password'
+
+    full_url = 'https://www.linkedin.com/company/_internal/mappers/analyticsFollowerDemographics?companyId=5005117&demographics=industry,seniority,company_size,function'
+
+    def __init__(self):
+
+        self.display = Display(visible=0, size=(800, 600))
+        self.display.start()
+        self.driver = webdriver.Firefox()
+
+    def init_request(self):
+
+        self.driver.get(LinkedinSpider.login_page)
+        self.driver.implicitly_wait(10)
+
+        self.driver.find_element_by_xpath('//input[@name="session_key"]').clear()
+        self.driver.find_element_by_xpath('//input[@name="session_key"]').send_keys(LinkedinSpider.ln_account_email)
+
+        self.driver.find_element_by_xpath('//input[@name="session_password"]').clear()
+        self.driver.find_element_by_xpath('//input[@name="session_password"]').send_keys(LinkedinSpider.ln_password)
+
+        self.driver.find_element_by_xpath('//input[@name="signin"]').click()
+
+        time.sleep(10)
+        cookies = self.driver.get_cookies()
+
+        cookie_dict = {}
+        for c in cookies:
+            cookie_dict[c['name']] = c['value']
+        
+        self.driver.close()
+        self.display.stop()
+
+        self.parse_data(cookie_dict)
+
+
+    def parse_data(self, cookies):
+        session = db_settings.session
+        total = session.query(db_settings.FollowersData).order_by(desc(db_settings.FollowersData.date)).first()
+        total = total.company_paid_followers+total.company_organic_followers
+        data = requests.get(LinkedinDemographicsData.full_url, cookies=cookies).json()['content']['biz_analytics_follower_demographics']['demographicsResults']
+
+        for x in data:
+            for y in x['demographicsSegments']:
+                key = {}
+
+                key['name'] = y['demographic']
+                key['date'] = datetime.date.today()
+
+                inst = session.query(db_settings.LinkedinDemographics).filter_by(**key).first()
+
+                if inst:
+                    obj = inst
+                else:
+                    obj = db_settings.LinkedinDemographics()
+                    obj.date = datetime.date.today()
+                    obj.category = x['demographicsType']
+                    obj.name = y['demographic']
+
+                obj.ratio = int(y['ratio']*total)
+                session.add(obj)
+                session.commit()

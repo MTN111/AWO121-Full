@@ -1,0 +1,7 @@
+selenium
+ghost
+sqlalchemy
+psycopg2
+ipdb
+lxml
+requests
